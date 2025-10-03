@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/fajar/Project/esp/sketch/wifi-adapter/build/CMakeFiles/bootloader
+/home/fajar/Project/esp/sketch/wifi-adapter/build/CMakeFiles/bootloader.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/CMakeFiles/bootloader-complete.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

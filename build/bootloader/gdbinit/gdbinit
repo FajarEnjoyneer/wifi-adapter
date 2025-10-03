@@ -1,0 +1,2 @@
+source /home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader/gdbinit/symbols
+source /home/fajar/Project/esp/sketch/wifi-adapter/build/bootloader/gdbinit/connect
