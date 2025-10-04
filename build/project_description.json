@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "wifi-adapter",
-    "project_version":    "8a90937-dirty",
+    "project_version":    "b737457-dirty",
     "project_path":       "/home/fajar/Project/esp/sketch/wifi-adapter",
     "idf_path":           "/home/fajar/Project/esp/esp-idf",
     "build_dir":          "/home/fajar/Project/esp/sketch/wifi-adapter/build",

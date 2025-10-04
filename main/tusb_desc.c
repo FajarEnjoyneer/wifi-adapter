@@ -12,8 +12,8 @@ const tusb_desc_device_t desc_device =
     .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
     .bDeviceProtocol    = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
-    .idVendor           = 0x303A,       // Espressif VID (change if needed)
-    .idProduct          = 0x4003,       // Product/PID you want
+    .idVendor           = 0x303A,       // Espressif VID
+    .idProduct          = 0x4003,       // Product/PID
     .bcdDevice          = 0x0100,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -22,62 +22,56 @@ const tusb_desc_device_t desc_device =
 };
 
 /* Full-speed configuration descriptor (raw ECM descriptor bytes).
-   Must match format expected by TinyUSB. Exported as symbol for main.c.
+   IMPORTANT: wTotalLength corrected to match the actual bytes below (79 bytes).
 */
 const uint8_t desc_fs_configuration[] = {
+    /* Configuration Descriptor */
     9, TUSB_DESC_CONFIGURATION,
-    61, 0x00,         // wTotalLength
-    2,                // bNumInterfaces
-    1,                // bConfigurationValue
-    0,                // iConfiguration
-    0x80,             // bmAttributes (bus-powered)
-    50,               // bMaxPower (100mA)
+    0x4F, 0x00,      /* wTotalLength = 79 (0x4F) */
+    2,               /* bNumInterfaces */
+    1,               /* bConfigurationValue */
+    0,               /* iConfiguration */
+    0x80,            /* bmAttributes (bus-powered) */
+    50,              /* bMaxPower (100mA) */
 
-    // Interface Association Descriptor (IAD)
+    /* Interface Association Descriptor (IAD) */
     8, TUSB_DESC_INTERFACE_ASSOCIATION,
-    0, 2,
-    TUSB_CLASS_CDC, 6 /*ECM subclass*/, 0,
+    0, 2,            /* first IF = 0, IF count = 2 */
+    TUSB_CLASS_CDC, 6 /*CDC_COMM_SUBCLASS_ETHERNET_CONTROL_MODEL*/, 0,
     0,
 
-    // Communication Interface Descriptor
+    /* Communication Interface Descriptor */
     9, TUSB_DESC_INTERFACE,
-    0, 0, 1,
+    0, 0, 1,         /* if=0, alt=0, 1 endpoint */
     TUSB_CLASS_CDC, 6 /*ECM*/, 0,
     0,
 
-    // Header Functional Descriptor
+    /* Header Functional Descriptor */
     5, 0x24, 0x00, 0x10, 0x01,
 
-    // Union Functional Descriptor
+    /* Union Functional Descriptor */
     5, 0x24, 0x06, 0, 1,
 
-    // Ethernet Networking Functional Descriptor
+    /* Ethernet Networking Functional Descriptor */
     13, 0x24, 0x0F,
     4, 0,0,0,0,
-    0xEA,0x05, 0,0, 0,
+    0xEA,0x05, 0,0, 0,   /* wMaxSegmentSize = 1514 (0x05EA), others zero */
 
-    // Notification Endpoint
+    /* Notification Endpoint (Interrupt IN) */
     7, TUSB_DESC_ENDPOINT,
     0x81, 0x03, 0x08, 0x00, 0x10,
 
-    // Data Interface Descriptor
+    /* Data Interface Descriptor (CDC Data) */
     9, TUSB_DESC_INTERFACE,
-    1, 0, 2,
-    0x0A, 0, 0,
+    1, 0, 2,         /* if=1, alt=0, 2 endpoints */
+    0x0A, 0, 0,      /* class = CDC Data (0x0A) */
     0,
 
-    // Endpoint OUT
+    /* Endpoint OUT (Bulk OUT) */
     7, TUSB_DESC_ENDPOINT,
     0x02, 0x02, 0x40, 0x00, 0,
 
-    // Endpoint IN
+    /* Endpoint IN (Bulk IN) */
     7, TUSB_DESC_ENDPOINT,
     0x82, 0x02, 0x40, 0x00, 0
 };
-
-/* Optionally, you can export a MAC string for the Ethernet functional descriptor,
-   but the wrapper can work without it if tusb_cfg.descriptor.string is NULL.
-   If you need strings passed via 'tusb_cfg.descriptor.string', you'll need to
-   build the string table in format expected by the wrapper. For now we keep it
-   simple and leave string pointer NULL in main.c.
-*/

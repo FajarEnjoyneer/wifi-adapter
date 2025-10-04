@@ -1,13 +1,21 @@
 /* main.c
  * ESP32-S3 WiFi client -> USB ECM/RNDIS dongle example (ESP-IDF v5.5)
  *
- * Notes:
- * - Provide tusb descriptors in main/tusb_desc.c (desc_device, desc_fs_configuration)
- * - This file sets those descriptors into tinyusb_config_t before installing driver.
+ * - Provides TinyUSB descriptor pointers (desc_device, desc_fs_configuration) via externs
+ * - Supplies string table to tinyusb via tusb_cfg.descriptor.string
+ * - Robust esp-netif DHCP stop + set IP with retries and lwIP fallback
+ * - TinyUSB <-> lwIP glue callbacks (tud_network_init_cb, tud_network_mac_address, tud_network_recv_cb)
+ *
+ * Requirements:
+ * - main/tusb_desc.c must export const tusb_desc_device_t desc_device;
+ *   and const uint8_t desc_fs_configuration[]; (no tud_descriptor_* functions here)
+ * - main/CMakeLists.txt must include "tusb_desc.c" in SRCS
+ * - In menuconfig ensure TinyUSB auto-descriptor is disabled if present
  */
 
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,37 +28,53 @@
 
 #include "esp_netif.h"
 #include "esp_netif_types.h"
-#include "esp_netif_ip_addr.h"   // esp_ip4addr_aton (returns uint32_t)
+#include "esp_netif_ip_addr.h"   // esp_ip4addr_aton
 #include "esp_wifi.h"
-
 
 #include "lwip/pbuf.h"
 #include "lwip/err.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/netif.h"
-#include "lwip/tcpip.h"   // optional, for tcpip_callback if needed
-#include "esp_netif_net_stack.h" // for esp_netif_get_netif_impl
+#include "lwip/tcpip.h"
+#include "esp_netif_net_stack.h" // esp_netif_get_netif_impl
 
 #include "tinyusb.h"
 #include "tusb.h"
 
-/* Externs: ensure these are implemented in main/tusb_desc.c and compiled into the project */
+/* Externs: descriptors provided in main/tusb_desc.c (descriptor-only, no tud_* callbacks) */
 extern const tusb_desc_device_t desc_device;
 extern const uint8_t desc_fs_configuration[];
 
 #ifndef CONFIG_WIFI_SSID
-#define CONFIG_WIFI_SSID "Angela"
+#define CONFIG_WIFI_SSID "OPT-WIFII"
 #endif
 #ifndef CONFIG_WIFI_PASSWORD
-#define CONFIG_WIFI_PASSWORD "angela99ma88"
+#define CONFIG_WIFI_PASSWORD "qwertyyu"
 #endif
 
 static const char *TAG = "usb_wifi_dongle";
 
+/* esp-netif handles */
 static esp_netif_t *sta_netif = NULL;
 static esp_netif_t *usb_netif = NULL;
 
-/* --- WiFi handlers --- */
+/* ------------------------------ TinyUSB string table ------------------------------
+   Index 0 is reserved (language ID). Fill manufacturer/product/serial and MAC string.
+   The wrapper expects 'const char *string_table[]' style; assign to tusb_cfg.descriptor.string.
+   ---------------------------------------------------------------------------------*/
+static const char *tusb_strings[] = {
+    "",                            /* 0: reserved - language (wrapper will add langid) */
+    "Espressif",                   /* 1: iManufacturer */
+    "ESP32-S3 ECM Dongle",         /* 2: iProduct */
+    "esp32s3-001",                 /* 3: iSerialNumber */
+    "001122334455"                 /* 4: iMAC string used by Ethernet functional descriptor (12 hex digits) */
+};
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+
+/* ------------------------------ WiFi event handlers ------------------------------ */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
@@ -79,7 +103,7 @@ static void got_ip_handler(void* arg, esp_event_base_t event_base,
 #endif
 }
 
-/* --- WiFi init --- */
+/* ------------------------------ WiFi init (STA) ------------------------------ */
 static void init_wifi_sta(void)
 {
     ESP_LOGI(TAG, "Initializing WiFi STA");
@@ -87,7 +111,7 @@ static void init_wifi_sta(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Create default wifi STA netif and store handle
+    /* Create default wifi STA netif and store handle */
     sta_netif = esp_netif_create_default_wifi_sta();
     if (!sta_netif) {
         ESP_LOGW(TAG, "Failed to create default wifi STA netif");
@@ -111,159 +135,29 @@ static void init_wifi_sta(void)
     ESP_LOGI(TAG, "WiFi STA started: connecting to SSID '%s'", CONFIG_WIFI_SSID);
 }
 
-/* TinyUSB initialization and creation of USB netif.
- * IMPORTANT: we populate tusb_cfg.descriptor.* with pointers to our descriptors
- * (desc_device, desc_fs_configuration) so the esp_tinyusb wrapper will register them.
- */
-static void tinyusb_init_and_create_usb_netif(void)
-{
-    ESP_LOGI(TAG, "Installing TinyUSB driver (with custom descriptors)");
+/* ------------------------------ TinyUSB <-> netif glue callbacks ------------------------------ */
 
-    tinyusb_config_t tusb_cfg;
-    memset(&tusb_cfg, 0, sizeof(tusb_cfg));
+/* Local MAC for USB network (locally administered) */
+static uint8_t s_usb_mac[6] = { 0x02, 0x00, 0x11, 0x22, 0x33, 0x44 };
 
-    /* Default port & PHY settings */
-    tusb_cfg.port = TINYUSB_PORT_FULL_SPEED_0;
-    tusb_cfg.phy.skip_setup = false;
-    tusb_cfg.phy.self_powered = false;
-    tusb_cfg.phy.vbus_monitor_io = -1;
-
-    /* Task config: must be > 0 */
-    tusb_cfg.task.size = 4096;
-    tusb_cfg.task.priority = 5;
-    tusb_cfg.task.xCoreID = 0;
-
-    /* --- IMPORTANT: provide descriptor pointers from tusb_desc.c --- */
-    tusb_cfg.descriptor.device = &desc_device;
-    tusb_cfg.descriptor.qualifier = NULL;
-    tusb_cfg.descriptor.full_speed_config = desc_fs_configuration;
-    tusb_cfg.descriptor.high_speed_config = NULL;
-    tusb_cfg.descriptor.string = NULL;
-    tusb_cfg.descriptor.string_count = 0;
-
-    tusb_cfg.event_cb = NULL;
-    tusb_cfg.event_arg = NULL;
-
-    /* Install driver (will call tinyusb_descriptors_set internally using provided descriptors) */
-    esp_err_t err = tinyusb_driver_install(&tusb_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "tinyusb_driver_install failed: %s (%d)", esp_err_to_name(err), err);
-        return;
-    }
-    ESP_LOGI(TAG, "TinyUSB Driver installed on port %d", tusb_cfg.port);
-
-    // Give TinyUSB task & driver a short moment to attach netif/backend
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    /* === create esp-netif for USB (use ETH template) === */
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
-    usb_netif = esp_netif_new(&cfg);
-    if (!usb_netif) {
-        ESP_LOGE(TAG, "Failed to create USB netif");
-        return;
-    }
-
-    /* debug: print underlying lwIP netif (if any) */
-    struct netif *maybe_netif = esp_netif_get_netif_impl(usb_netif);
-    if (maybe_netif) {
-        ESP_LOGI(TAG, "Underlying lwIP netif found: name='%c%c' num=%d flags=0x%08x",
-                 maybe_netif->name[0], maybe_netif->name[1], maybe_netif->num, maybe_netif->flags);
-    } else {
-        ESP_LOGI(TAG, "No underlying lwIP netif attached yet (will continue and try to set IP/fallback).");
-    }
-
-    /* === prepare ip info (192.168.42.1/24) === */
-    esp_netif_ip_info_t ip_info;
-    memset(&ip_info, 0, sizeof(ip_info));
-    ip_info.ip.addr      = esp_ip4addr_aton("192.168.42.1");
-    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
-    ip_info.gw.addr      = esp_ip4addr_aton("192.168.42.1");
-
-    /* === stop DHCP server with retries (some netif take time to be ready) === */
-    esp_err_t rc = ESP_FAIL;
-    const int max_retries = 10;
-    for (int i = 0; i < max_retries; ++i) {
-        rc = esp_netif_dhcps_stop(usb_netif);
-        if (rc == ESP_OK) {
-            ESP_LOGI(TAG, "esp_netif_dhcps_stop OK on attempt %d", i+1);
-            break;
-        }
-        // If DHCP not started yet or not stoppable, keep trying briefly
-        ESP_LOGW(TAG, "esp_netif_dhcps_stop attempt %d returned %s (%d), retrying...", i+1, esp_err_to_name(rc), rc);
-        vTaskDelay(pdMS_TO_TICKS(100)); // cumulative up to ~1s
-    }
-
-    if (rc != ESP_OK) {
-        // Convert common DHCP_NOT_STOPPED into a non-fatal condition: try lwIP fallback
-        ESP_LOGW(TAG, "esp_netif_dhcps_stop failed after retries: %s (%d). Will attempt lwIP fallback.", esp_err_to_name(rc), rc);
-        struct netif *lwip_netif = esp_netif_get_netif_impl(usb_netif);
-        if (lwip_netif) {
-            ip4_addr_t ip, nm, gw;
-            IP4_ADDR(&ip, 192,168,42,1);
-            IP4_ADDR(&nm, 255,255,255,0);
-            IP4_ADDR(&gw, 192,168,42,1);
-            netif_set_addr(lwip_netif, &ip, &nm, &gw);
-            ESP_LOGI(TAG, "Fallback: set lwIP netif addr to 192.168.42.1/24");
-        } else {
-            ESP_LOGW(TAG, "Fallback: could not obtain lwIP netif for usb_netif (will still try to start dhcp server)");
-        }
-    } else {
-        /* DHCP stopped successfully — set IP via esp-netif API */
-        rc = esp_netif_set_ip_info(usb_netif, &ip_info);
-        if (rc != ESP_OK) {
-            ESP_LOGW(TAG, "esp_netif_set_ip_info failed: %s (%d). Attempting lwIP fallback.", esp_err_to_name(rc), rc);
-            struct netif *lwip_netif = esp_netif_get_netif_impl(usb_netif);
-            if (lwip_netif) {
-                ip4_addr_t ip, nm, gw;
-                IP4_ADDR(&ip, 192,168,42,1);
-                IP4_ADDR(&nm, 255,255,255,0);
-                IP4_ADDR(&gw, 192,168,42,1);
-                netif_set_addr(lwip_netif, &ip, &nm, &gw);
-                ESP_LOGI(TAG, "Fallback: set lwIP netif addr to 192.168.42.1/24");
-            }
-        } else {
-            ESP_LOGI(TAG, "esp_netif_set_ip_info OK");
-        }
-    }
-
-    /* === start DHCP server on USB interface === */
-    rc = esp_netif_dhcps_start(usb_netif);
-    if (rc != ESP_OK) {
-        ESP_LOGW(TAG, "esp_netif_dhcps_start returned %s (%d). Host may still be able to use static IP.", esp_err_to_name(rc), rc);
-    } else {
-        ESP_LOGI(TAG, "USB DHCP server started");
-    }
-
-    ESP_LOGI(TAG, "TinyUSB initialized and USB netif ready. Host should see a USB ethernet interface (usb0/enx...).");
-}
-
-/* ---------------- TinyUSB network callbacks (glue to lwIP) -----------------*/
-/* These callbacks are required by esp_tinyusb's net class implementation.
-   They bridge TinyUSB <-> lwIP (esp-netif). */
-
-static uint8_t s_usb_mac[6] = { 0x02, 0x00, 0x00, 0x12, 0x34, 0x56 }; // locally administered MAC (change if desired)
-
-/* Called by TinyUSB when network interface is initialized (link up). */
+/* Called by TinyUSB when network interface initialized (link up) */
 void tud_network_init_cb(void)
 {
     ESP_LOGI(TAG, "tud_network_init_cb called (USB network interface initialized)");
-    // Optional: you could set link flags, trigger DHCP server start, etc.
 }
 
-/* Return pointer to 6-byte MAC address used for the USB network interface.
-   TinyUSB will read this to provide MAC to host (RNDIS/ECM). */
+/* Return pointer to MAC address */
 const uint8_t* tud_network_mac_address(void)
 {
     return s_usb_mac;
 }
 
-/* Called by TinyUSB when a frame has been received from host (USB -> device).
-   This function should deliver packet to lwIP. Return true on success. */
+/* Called when a frame arrives from USB host (USB -> device).
+   We hand the frame into lwIP netif via netif->input() */
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
 {
     if (!src || size == 0) return false;
 
-    // Obtain underlying lwIP netif for the USB esp_netif we created earlier.
     if (!usb_netif) {
         ESP_LOGW(TAG, "tud_network_recv_cb: usb_netif is NULL");
         return false;
@@ -275,19 +169,16 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
         return false;
     }
 
-    // Allocate a pbuf from pool to hand to lwIP
     struct pbuf *p = pbuf_alloc(PBUF_RAW, size, PBUF_POOL);
     if (!p) {
         ESP_LOGW(TAG, "tud_network_recv_cb: pbuf_alloc failed for size %u", size);
         return false;
     }
 
-    // copy packet data into pbuf chain (p->payload guaranteed for single pbuf)
-    // If packet larger than first pbuf, should iterate; typical USB net frames fit single pbuf.
+    /* copy into pbuf chain */
     if (p->len >= size) {
         memcpy(p->payload, src, size);
     } else {
-        // If pbuf chain, copy in segments
         uint16_t copied = 0;
         struct pbuf *q = p;
         while (q && copied < size) {
@@ -298,11 +189,7 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
         }
     }
 
-    // Hand packet to lwIP input. Note: in some lwIP configs netif->input expects to run
-    // in tcpip_thread. If you experience crashes, switch to tcpip_callback to call this
-    // inside tcpip_thread context.
-#if 1
-    // Direct call (works for many esp-idf/lwip builds)
+    /* Direct deliver to lwIP. If your port requires tcpip thread, replace with tcpip_try_callback/tcpip_callback_with_block */
     err_t res = lwip_netif->input(p, lwip_netif);
     if (res != ERR_OK) {
         ESP_LOGW(TAG, "tud_network_recv_cb: netif->input returned %d", res);
@@ -310,25 +197,151 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
         return false;
     }
     return true;
-#else
-    // Safer (if tcpip_callback is available): post to tcpip thread
-    struct pbuf *p_copy = p; // transfer ownership to callback
-    err_t post = tcpip_try_callback( (tcpip_callback_fn)lwip_netif->input, (void*)p_copy );
-    if (post != ERR_OK) {
-        // fallback: try direct input or free pbuf
-        if (lwip_netif->input(p, lwip_netif) != ERR_OK) {
-            pbuf_free(p);
-            return false;
-        }
-    }
-    return true;
-#endif
 }
 
+/* ------------------------------ TinyUSB init + USB netif create ------------------------------ */
+static void tinyusb_init_and_create_usb_netif(void)
+{
+    ESP_LOGI(TAG, "Installing TinyUSB driver (with custom descriptors & strings)");
 
+    tinyusb_config_t tusb_cfg;
+    memset(&tusb_cfg, 0, sizeof(tusb_cfg));
 
+    tusb_cfg.port = TINYUSB_PORT_FULL_SPEED_0;
+    tusb_cfg.phy.skip_setup = false;
+    tusb_cfg.phy.self_powered = false;
+    tusb_cfg.phy.vbus_monitor_io = -1;
 
-/* --- main --- */
+    /* Task config */
+    tusb_cfg.task.size = 4096;
+    tusb_cfg.task.priority = 5;
+    tusb_cfg.task.xCoreID = 0;
+
+    /* Provide descriptor arrays from tusb_desc.c */
+    tusb_cfg.descriptor.device = &desc_device;
+    tusb_cfg.descriptor.qualifier = NULL;
+    tusb_cfg.descriptor.full_speed_config = desc_fs_configuration;
+    tusb_cfg.descriptor.high_speed_config = NULL;
+
+    /* Provide string table to wrapper so it can create string descriptors */
+    tusb_cfg.descriptor.string = tusb_strings;
+    tusb_cfg.descriptor.string_count = (uint8_t) ARRAY_SIZE(tusb_strings);
+
+    tusb_cfg.event_cb = NULL;
+    tusb_cfg.event_arg = NULL;
+
+    /* Install; wrapper will call tinyusb_descriptors_set internally */
+    esp_err_t err = tinyusb_driver_install(&tusb_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "tinyusb_driver_install failed: %s (%d)", esp_err_to_name(err), err);
+        return;
+    }
+    ESP_LOGI(TAG, "TinyUSB Driver installed on port %d", tusb_cfg.port);
+
+    /* give driver a moment */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* create esp-netif for USB using ETH template */
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    usb_netif = esp_netif_new(&cfg);
+    if (!usb_netif) {
+        ESP_LOGE(TAG, "Failed to create USB netif");
+        return;
+    }
+
+    /* debug: print lwIP netif if attached */
+    struct netif *maybe_netif = esp_netif_get_netif_impl(usb_netif);
+    if (maybe_netif) {
+        ESP_LOGI(TAG, "Underlying lwIP netif found: name='%c%c' num=%d flags=0x%08x",
+                 maybe_netif->name[0], maybe_netif->name[1], maybe_netif->num, maybe_netif->flags);
+    } else {
+        ESP_LOGI(TAG, "No underlying lwIP netif attached yet (will try to set IP/fallback).");
+    }
+
+    /* prepare IP info */
+    esp_netif_ip_info_t ip_info;
+    memset(&ip_info, 0, sizeof(ip_info));
+    ip_info.ip.addr      = esp_ip4addr_aton("192.168.42.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    ip_info.gw.addr      = esp_ip4addr_aton("192.168.42.1");
+
+    /* Robust DHCP stop + set IP sequence with retries */
+    esp_err_t rc = ESP_FAIL;
+    const int max_stop_retries = 8;
+    for (int i = 0; i < max_stop_retries; ++i) {
+        rc = esp_netif_dhcps_stop(usb_netif);
+        if (rc == ESP_OK) {
+            ESP_LOGI(TAG, "esp_netif_dhcps_stop OK on attempt %d", i+1);
+            break;
+        }
+        ESP_LOGW(TAG, "esp_netif_dhcps_stop attempt %d returned %s (%d), retrying...", i+1, esp_err_to_name(rc), rc);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    if (rc == ESP_OK) {
+        /* try set ip with retries; if DHCP_NOT_STOPPED appears, attempt dhcps_stop again and retry */
+        const int max_set_retries = 8;
+        bool set_ok = false;
+        for (int j = 0; j < max_set_retries; ++j) {
+            rc = esp_netif_set_ip_info(usb_netif, &ip_info);
+            if (rc == ESP_OK) {
+                ESP_LOGI(TAG, "esp_netif_set_ip_info OK on try %d", j+1);
+                set_ok = true;
+                break;
+            }
+            if (rc == ESP_ERR_ESP_NETIF_DHCP_NOT_STOPPED) {
+                ESP_LOGW(TAG, "esp_netif_set_ip_info returned DHCP_NOT_STOPPED on try %d. Calling dhcps_stop and retrying...", j+1);
+                esp_err_t s = esp_netif_dhcps_stop(usb_netif);
+                ESP_LOGI(TAG, "esp_netif_dhcps_stop returned %s (%d) during recovery", esp_err_to_name(s), s);
+                vTaskDelay(pdMS_TO_TICKS(150));
+                continue;
+            }
+            ESP_LOGW(TAG, "esp_netif_set_ip_info attempt %d returned %s (%d), retrying...", j+1, esp_err_to_name(rc), rc);
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+
+        if (!set_ok) {
+            ESP_LOGW(TAG, "esp_netif_set_ip_info failed after retries: %s (%d). Will attempt lwIP fallback.", esp_err_to_name(rc), rc);
+            struct netif *lwip_netif = esp_netif_get_netif_impl(usb_netif);
+            if (lwip_netif) {
+                ip4_addr_t ip, nm, gw;
+                IP4_ADDR(&ip, 192,168,42,1);
+                IP4_ADDR(&nm, 255,255,255,0);
+                IP4_ADDR(&gw, 192,168,42,1);
+                netif_set_addr(lwip_netif, &ip, &nm, &gw);
+                ESP_LOGI(TAG, "Fallback: set lwIP netif addr to 192.168.42.1/24");
+            } else {
+                ESP_LOGW(TAG, "Fallback: could not obtain lwIP netif for usb_netif (will still try to start dhcp server)");
+            }
+        }
+    } else {
+        /* dhcps_stop never succeeded — fallback immediately to lwIP netif if possible */
+        ESP_LOGW(TAG, "esp_netif_dhcps_stop failed after retries: %s (%d). Will attempt lwIP fallback.", esp_err_to_name(rc), rc);
+        struct netif *lwip_netif = esp_netif_get_netif_impl(usb_netif);
+        if (lwip_netif) {
+            ip4_addr_t ip, nm, gw;
+            IP4_ADDR(&ip, 192,168,42,1);
+            IP4_ADDR(&nm, 255,255,255,0);
+            IP4_ADDR(&gw, 192,168,42,1);
+            netif_set_addr(lwip_netif, &ip, &nm, &gw);
+            ESP_LOGI(TAG, "Fallback: set lwIP netif addr to 192.168.42.1/24");
+        } else {
+            ESP_LOGW(TAG, "Fallback: could not obtain lwIP netif for usb_netif");
+        }
+    }
+
+    /* start DHCP server on USB interface */
+    rc = esp_netif_dhcps_start(usb_netif);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "esp_netif_dhcps_start returned %s (%d). Host may still be able to use static IP.", esp_err_to_name(rc), rc);
+    } else {
+        ESP_LOGI(TAG, "USB DHCP server started");
+    }
+
+    ESP_LOGI(TAG, "TinyUSB initialized and USB netif ready. Host should see a USB ethernet interface (usb0/enx...).");
+}
+
+/* ------------------------------ app_main ------------------------------ */
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
