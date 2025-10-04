@@ -22,7 +22,7 @@ const tusb_desc_device_t desc_device =
 };
 
 /* Full-speed configuration descriptor (raw ECM descriptor bytes).
-   IMPORTANT: wTotalLength corrected to match the actual bytes below (79 bytes).
+   IMPORTANT: wTotalLength set to 79 (0x4F) matching descriptor bytes below.
 */
 const uint8_t desc_fs_configuration[] = {
     /* Configuration Descriptor */
@@ -54,8 +54,11 @@ const uint8_t desc_fs_configuration[] = {
 
     /* Ethernet Networking Functional Descriptor */
     13, 0x24, 0x0F,
-    4, 0,0,0,0,
-    0xEA,0x05, 0,0, 0,   /* wMaxSegmentSize = 1514 (0x05EA), others zero */
+    4,                  /* iMACAddress string index = 4 */
+    0x00,0x00,0x00,0x00,/* bmEthernetStatistics (4 bytes) */
+    0xEA,0x05,          /* wMaxSegmentSize = 1514 (0x05EA) little-endian */
+    0x00,0x00,          /* wNumberMCFilters */
+    0x00,               /* bNumberPowerFilters */
 
     /* Notification Endpoint (Interrupt IN) */
     7, TUSB_DESC_ENDPOINT,

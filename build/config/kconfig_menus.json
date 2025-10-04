@@ -28030,10 +28030,7 @@
                         "help": "Config max number of IPv6 packets to queue during MAC resolution.",
                         "id": "LWIP_IPV6_MEMP_NUM_ND6_QUEUE",
                         "name": "LWIP_IPV6_MEMP_NUM_ND6_QUEUE",
-                        "range": [
-                            3,
-                            20
-                        ],
+                        "range": null,
                         "title": "Max number of IPv6 packets to queue during MAC resolution",
                         "type": "int"
                     },
@@ -28043,10 +28040,7 @@
                         "help": "Config max number of entries in IPv6 neighbor cache",
                         "id": "LWIP_IPV6_ND6_NUM_NEIGHBORS",
                         "name": "LWIP_IPV6_ND6_NUM_NEIGHBORS",
-                        "range": [
-                            3,
-                            10
-                        ],
+                        "range": null,
                         "title": "Max number of entries in IPv6 neighbor cache",
                         "type": "int"
                     },
