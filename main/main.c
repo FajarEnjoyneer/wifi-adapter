@@ -1,26 +1,22 @@
 /* main.c
  * ESP32-S3 WiFi client -> USB ECM/RNDIS dongle example (ESP-IDF v5.5)
  *
- * Changes applied:
- *  - Provide minimal TinyUSB string descriptors to avoid "No String descriptors" warning.
- *  - Robust DHCP stop + single-shot esp_netif_set_ip_info with deterministic lwIP fallback
- *    (avoids repeated ESP_ERR_ESP_NETIF_DHCP_NOT_STOPPED logs).
- *  - Start USB DHCP server when TinyUSB network backend signals ready (tud_network_init_cb).
- *  - TinyUSB <-> lwIP glue callbacks (tud_network_*).
- *  - Disable WiFi power-save (WIFI_PS_NONE) for STA stability (optional).
+ * Integrated fixes:
+ *  - Safe pbuf handling + schedule delivery to tcpip thread (avoid direct netif->input from callback).
+ *  - Non-blocking tud_network_init_cb (creates task usb_dhcp_start_task to wait/start DHCP).
+ *  - Reconnect/backoff logic for WiFi STA with reason logging.
+ *  - Minimal TinyUSB descriptors usage (desc_device, desc_fs_configuration required).
  *
- * Requirements:
- *  - main/tusb_desc.c must export:
- *       const tusb_desc_device_t desc_device;
- *       const uint8_t desc_fs_configuration[];
- *
- *  - Ensure TinyUSB is configured to accept external descriptors in menuconfig / tusb_config.h.
+ * NOTE: Ensure your project includes tusb_desc.c providing:
+ *   const tusb_desc_device_t desc_device;
+ *   const uint8_t desc_fs_configuration[];
  */
 
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,6 +26,7 @@
 #include "nvs_flash.h"
 #include "esp_system.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 
 #include "esp_netif.h"
 #include "esp_netif_types.h"
@@ -66,8 +63,7 @@ static esp_netif_t *usb_netif = NULL;
 
 /* ---------------- TinyUSB minimal string descriptors ----------------
    Index 0 is reserved (language ID). Provide manufacturer/product/serial.
-   The wrapper expects 'const char *string_table[]' style; assign to tusb_cfg.descriptor.string.
-   --------------------------------------------------------------------*/
+*/
 static const char *tusb_strings[] = {
     "",                         /* 0: reserved (language ID placeholder) */
     "Espressif",                /* 1: iManufacturer */
@@ -80,16 +76,78 @@ static const char *tusb_strings[] = {
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #endif
 
+/* ---------------- WiFi reconnect/backoff state ---------------- */
+static esp_timer_handle_t s_reconnect_timer = NULL;
+static int s_retry_num = 0;
+#define WIFI_MAX_RETRY 6
+#define WIFI_RECONNECT_BASE_MS 1000
+#define WIFI_RECONNECT_MAX_MS 30000
+
+/* forward decl */
+static void reconnect_timer_cb(void *arg);
+
+/* Utility: start reconnect timer with exponential backoff */
+static void start_reconnect_timer(void)
+{
+    if (!s_reconnect_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = &reconnect_timer_cb,
+            .name = "wifi_reconn_cb"
+        };
+        esp_err_t rc = esp_timer_create(&args, &s_reconnect_timer);
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "Failed create reconnect timer: %s", esp_err_to_name(rc));
+            s_reconnect_timer = NULL;
+            return;
+        }
+    }
+
+    /* compute delay: base * 2^retry, capped */
+    uint64_t shift = (s_retry_num > 31) ? 31 : s_retry_num;
+    uint64_t delay_ms = (uint64_t)WIFI_RECONNECT_BASE_MS << shift;
+    if (delay_ms > WIFI_RECONNECT_MAX_MS) delay_ms = WIFI_RECONNECT_MAX_MS;
+
+    uint64_t delay_us = delay_ms * 1000ULL;
+    ESP_LOGI(TAG, "Scheduling reconnect in %llu ms (retry %d)", (unsigned long long)delay_ms, s_retry_num);
+    esp_timer_start_once(s_reconnect_timer, delay_us);
+}
+
+/* reconnect timer callback: try connect */
+static void reconnect_timer_cb(void *arg)
+{
+    ESP_LOGI(TAG, "reconnect_timer_cb: attempting esp_wifi_connect (retry %d)", s_retry_num);
+    esp_err_t rc = esp_wifi_connect();
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_connect() returned %s (%d)", esp_err_to_name(rc), rc);
+    }
+}
+
 /* ---------------- WiFi event handlers ---------------- */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "WIFI_EVENT_STA_START -> connecting");
-        esp_wifi_connect();
+        s_retry_num = 0;
+        esp_err_t rc = esp_wifi_connect();
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "esp_wifi_connect() failed: %s", esp_err_to_name(rc));
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
-        esp_wifi_connect();
+        /* event_data is wifi_event_sta_disconnected_t* */
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        int reason = 0;
+        if (disc) reason = disc->reason;
+        ESP_LOGW(TAG, "WiFi disconnected (reason=%d).", reason);
+
+        /* increase retry counter and decide action */
+        if (s_retry_num < WIFI_MAX_RETRY) {
+            s_retry_num++;
+            start_reconnect_timer();
+        } else {
+            ESP_LOGW(TAG, "Reached max retry (%d). Not attempting further reconnects automatically.", WIFI_MAX_RETRY);
+            /* Optionally: you can reset WiFi or call esp_restart() here */
+        }
     }
 }
 
@@ -98,6 +156,12 @@ static void got_ip_handler(void* arg, esp_event_base_t event_base,
 {
     ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
     ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+
+    /* reset retry/backoff state */
+    s_retry_num = 0;
+    if (s_reconnect_timer) {
+        esp_timer_stop(s_reconnect_timer);
+    }
 
 #if CONFIG_LWIP_IPV4_NAPT
     if (sta_netif) {
@@ -157,43 +221,74 @@ static uint8_t s_usb_mac[6] = { 0x02, 0x00, 0x11, 0x22, 0x33, 0x44 };
 /* Forward declaration for helper that sets USB netif IP (used both in init and in tud callback) */
 static void ensure_usb_netif_has_ip(void);
 
-/* Called by TinyUSB when network interface is initialized (link up) */
-void tud_network_init_cb(void)
+/* ---------------- helper: deliver pbuf to tcpip thread (avoid direct netif->input call) --------------- */
+struct recv_arg {
+    struct pbuf *p;
+    struct netif *netif;
+};
+
+static void netif_input_cb(void *arg)
 {
-    ESP_LOGI(TAG, "tud_network_init_cb called (USB network interface initialized)");
-
-    /* When TinyUSB network backend attaches, start DHCP server on usb_netif.
-       This avoids race where main init tries to start DHCP before backend ready. */
-    if (!usb_netif) {
-        ESP_LOGW(TAG, "tud_network_init_cb: usb_netif is NULL (cannot start DHCP yet)");
-        return;
+    struct recv_arg *ra = (struct recv_arg *)arg;
+    if (!ra) return;
+    if (ra->netif && ra->p) {
+        err_t res = ra->netif->input(ra->p, ra->netif);
+        if (res != ERR_OK) {
+            ESP_LOGW(TAG, "netif_input_cb: netif->input returned %d", res);
+            pbuf_free(ra->p);
+        }
     }
+    free(ra);
+}
 
-    /* Wait briefly for lwIP netif to attach (TinyUSB may attach asynchronously) */
+/* task used by tud_network_init_cb to avoid blocking in TinyUSB callback context */
+static void usb_dhcp_start_task(void *arg)
+{
+    esp_netif_t *netif = (esp_netif_t *) arg;
     struct netif *maybe_netif = NULL;
     int waited = 0;
     while (waited < 2000) {
-        maybe_netif = esp_netif_get_netif_impl(usb_netif);
+        maybe_netif = esp_netif_get_netif_impl(netif);
         if (maybe_netif) break;
         vTaskDelay(pdMS_TO_TICKS(100));
         waited += 100;
     }
     if (!maybe_netif) {
-        ESP_LOGW(TAG, "tud_network_init_cb: underlying lwIP netif not attached after %d ms", waited);
+        ESP_LOGW(TAG, "usb_dhcp_start_task: underlying lwIP netif not attached after %d ms", waited);
     } else {
-        ESP_LOGI(TAG, "tud_network_init_cb: underlying lwIP netif ready (name='%c%c' num=%d)",
+        ESP_LOGI(TAG, "usb_dhcp_start_task: underlying lwIP netif ready (name='%c%c' num=%d)",
                  maybe_netif->name[0], maybe_netif->name[1], maybe_netif->num);
     }
 
-    /* Ensure USB netif has IP assigned (use esp-netif API if possible, else lwIP fallback) */
+    /* ensure IP set */
     ensure_usb_netif_has_ip();
 
-    /* Start DHCP server for host */
-    esp_err_t rc = esp_netif_dhcps_start(usb_netif);
+    esp_err_t rc = esp_netif_dhcps_start(netif);
     if (rc != ESP_OK) {
-        ESP_LOGW(TAG, "tud_network_init_cb: esp_netif_dhcps_start returned %s (%d)", esp_err_to_name(rc), rc);
+        ESP_LOGW(TAG, "usb_dhcp_start_task: esp_netif_dhcps_start returned %s (%d)", esp_err_to_name(rc), rc);
     } else {
-        ESP_LOGI(TAG, "tud_network_init_cb: USB DHCP server started");
+        ESP_LOGI(TAG, "usb_dhcp_start_task: USB DHCP server started");
+    }
+
+    vTaskDelete(NULL);
+}
+
+/* Called by TinyUSB when network interface is initialized (link up) */
+void tud_network_init_cb(void)
+{
+    ESP_LOGI(TAG, "tud_network_init_cb called (USB network interface initialized)");
+
+    if (!usb_netif) {
+        ESP_LOGW(TAG, "tud_network_init_cb: usb_netif is NULL (cannot start DHCP yet)");
+        return;
+    }
+
+    /* create a task to wait and start DHCP (non-blocking in TinyUSB callback) */
+    BaseType_t rc = xTaskCreate(usb_dhcp_start_task, "usb_dhcp_task", 2048, usb_netif, 5, NULL);
+    if (rc != pdPASS) {
+        ESP_LOGW(TAG, "tud_network_init_cb: failed to create usb_dhcp_task");
+    } else {
+        ESP_LOGI(TAG, "tud_network_init_cb: usb_dhcp_task created");
     }
 }
 
@@ -204,7 +299,7 @@ const uint8_t* tud_network_mac_address(void)
 }
 
 /* Called by TinyUSB when a frame has been received from host (USB -> device).
-   Delivers packet to lwIP. */
+   Deliver packet to lwIP via tcpip thread callback to be thread-safe. */
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
 {
     if (!src || size == 0) return false;
@@ -226,6 +321,13 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
         return false;
     }
 
+    /* Safety: check total capacity of pbuf chain */
+    if (p->tot_len < size) {
+        ESP_LOGW(TAG, "tud_network_recv_cb: allocated tot_len %u < frame size %u", p->tot_len, size);
+        pbuf_free(p);
+        return false;
+    }
+
     /* copy into pbuf chain */
     if (p->len >= size) {
         memcpy(p->payload, src, size);
@@ -240,13 +342,24 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
         }
     }
 
-    /* Deliver directly to lwIP. If crashes appear on your build, switch to tcpip_callback. */
-    err_t res = lwip_netif->input(p, lwip_netif);
-    if (res != ERR_OK) {
-        ESP_LOGW(TAG, "tud_network_recv_cb: netif->input returned %d", res);
+    /* schedule delivery on tcpip thread */
+    struct recv_arg *ra = malloc(sizeof(*ra));
+    if (!ra) {
         pbuf_free(p);
         return false;
     }
+    ra->p = p;
+    ra->netif = lwip_netif;
+
+    err_t cb_rc = tcpip_callback_with_block(netif_input_cb, ra, 0);
+    if (cb_rc != ERR_OK) {
+        ESP_LOGW(TAG, "tud_network_recv_cb: tcpip_callback_with_block returned %d", cb_rc);
+        /* callback not scheduled: cleanup */
+        pbuf_free(p);
+        free(ra);
+        return false;
+    }
+
     return true;
 }
 
