@@ -1,19 +1,21 @@
-# TinyUSB (use correct Kconfig symbol names present in components/esp_tinyusb/Kconfig)
-CONFIG_TINYUSB_CDC_ENABLED=n             # disable CDC-ACM serial (optional; set to 1 if you want both serial + net)
-CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y      # enable ECM/RNDIS composite network mode (Linux friendly ECM + RNDIS)
-# optionally choose NCM instead if you need NCM:
-# CONFIG_TINYUSB_NET_MODE_NCM=y
+# TinyUSB (ECM/RNDIS) — jika Anda menyediakan custom tusb_desc.c sendiri
+CONFIG_TINYUSB_CDC_ENABLED=n
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y
 
-# Keep these descriptor strings (adjust if you want custom strings)
+# Descriptor strings (opsional)
 CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=y
 CONFIG_TINYUSB_DESC_BCD_DEVICE=0x0100
 CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="Espressif"
 CONFIG_TINYUSB_DESC_PRODUCT_STRING="ESP32-S3 USB-Ethernet"
 CONFIG_TINYUSB_DESC_SERIAL_STRING="esp32s3-001"
-# disable auto setup
-#CONFIG_TINYUSB_DESC_AUTO_SETUP=y
 
+# LWIP / DHCP / NAT
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
+CONFIG_LWIP_DHCPS=y
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=8
 CONFIG_LWIP_IPV6=n
-CONFIG_LWIP_HOOK_TCP_ISN_DEFAULT=y
+
+# Optional WiFi defaults (bisa override di menuconfig atau di code)
+#CONFIG_WIFI_SSID="OPT-WIFII"
+#CONFIG_WIFI_PASSWORD="qwertyyu"
